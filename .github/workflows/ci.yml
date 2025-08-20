@@ -4,6 +4,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      DATABASE_URL: "file:./prisma/dev.db"
+      SKIP_ADMIN: "1"
+      RETURN_PROVISIONAL_IN_RESPONSE: "1"
+      JWT_SECRET: "ci-secret"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -11,9 +16,7 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
-      - run: npx prisma generate
+      - run: npx prisma generate --schema prisma/schema.prisma
+      - run: npx prisma db push --force-reset --schema prisma/schema.prisma
+      - run: npx ts-node src/seed.ts
       - run: npm test
-        env:
-          SKIP_ADMIN: "1"
-          RETURN_PROVISIONAL_IN_RESPONSE: "1"
-          JWT_SECRET: "ci-secret"
