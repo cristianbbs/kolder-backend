@@ -4,31 +4,31 @@ import { requireAuth } from '../auth/middleware.ts';
 
 export const productsRouter = Router();
 
-// Todas estas rutas requieren auth
 productsRouter.use(requireAuth);
 
+/* -------------------- helper de error unificado -------------------- */
+function err(res: any, status: number, code: string, message: string, issues?: unknown) {
+  const body: any = { ok: false, code, message };
+  if (issues !== undefined) body.issues = issues;
+  return res.status(status).json(body);
+}
+
 /**
- * GET /products/catalog   (alias: /products, /products/categories)
+ * GET /products/catalog  (alias: /products, /products/categories)
  * Responde:
- * {
- *   categories: [
- *     { id, name, products: [{ id, title, detail, imageUrl }] }
- *   ]
- * }
+ * { ok: true, categories: [{ id, name, products: [{ id, title, detail, imageUrl }] }] }
  *
  * Nota:
- * - No se vuelve a leer el usuario en BD. Usamos req.user.companyId.
- * - Si la empresa no tiene productos habilitados, devolvemos categorías con 0 productos (UI muestra estado vacío).
+ * - Filtra SIEMPRE por allow-list de la empresa.
+ * - **Se excluyen** categorías con 0 productos (comportamiento que ya tienes).
  */
 async function getCatalogByCompany(companyId: number) {
-  // Productos habilitados para la empresa
   const allowed = await prisma.companyProduct.findMany({
     where: { companyId },
     select: { productId: true },
   });
   const allowedIds = new Set(allowed.map(a => a.productId));
 
-  // Si no hay habilitados, devolvemos categorías vacías (la UI ya maneja "No hay productos habilitados")
   const cats = await prisma.category.findMany({
     orderBy: { name: 'asc' },
     include: {
@@ -39,29 +39,28 @@ async function getCatalogByCompany(companyId: number) {
     },
   });
 
-  // Filtra por habilitados
-  const categories = cats.map(c => ({
-    id: c.id,
-    name: c.name,
-    products: c.products.filter(p => allowedIds.has(p.id)),
-  }));
+  const categories = cats
+    .map(c => ({
+      id: c.id,
+      name: c.name,
+      products: c.products.filter(p => allowedIds.has(p.id)),
+    }))
+    .filter(c => c.products.length > 0); // <- mantener tu filtro de vacías
 
-  // Log útil
   const total = categories.reduce((acc, c) => acc + c.products.length, 0);
   console.log(`[API] /products -> ${categories.length} categorías, ${total} productos`);
-  return { categories: categories.filter(c => c.products.length > 0) };
+  return { categories };
 }
 
-// Handler principal
 productsRouter.get(['/catalog', '/', '/categories'], async (req: any, res) => {
   const companyIdRaw = req?.user?.companyId;
   if (!Number.isFinite(Number(companyIdRaw))) {
-    return res.status(400).json({ error: 'Tu usuario no tiene empresa asignada' });
+    return err(res, 400, 'NO_COMPANY', 'Tu usuario no tiene empresa asignada');
   }
   const companyId = Number(companyIdRaw);
 
   const data = await getCatalogByCompany(companyId);
-  return res.json(data);
+  return res.json({ ok: true, ...data });
 });
 
 export default productsRouter;
