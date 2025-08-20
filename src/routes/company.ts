@@ -16,13 +16,19 @@ function parseId(s: any) {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+function err(res: any, status: number, code: string, message: string, issues?: unknown) {
+  const body: any = { ok: false, code, message };
+  if (issues !== undefined) body.issues = issues;
+  return res.status(status).json(body);
+}
+
 /** Retorna true si el actor puede operar sobre companyId; si no, responde 403. */
 function assertScopeOr403(req: any, res: any, companyId: number) {
   const role: Role | undefined = req.user?.role;
   const userCompanyId = req.user?.companyId ?? null;
   if (role === Role.SUPER_ADMIN) return true;
   if (role === Role.COMPANY_ADMIN && Number(userCompanyId) === companyId) return true;
-  res.status(403).json({ error: 'Forbidden' });
+  err(res, 403, 'FORBIDDEN', 'Fuera del alcance de tu empresa');
   return false;
 }
 
@@ -30,9 +36,9 @@ function assertScopeOr403(req: any, res: any, companyId: number) {
 companyRouter.get('/me', requireAuth, async (req: any, res) => {
   const userId: number = req.user.id;
   const me = await prisma.user.findUnique({ where: { id: userId }, include: { company: true } });
-  if (!me) return res.status(404).json({ error: 'Usuario no encontrado' });
+  if (!me) return err(res, 404, 'NOT_FOUND', 'Usuario no encontrado');
   const company = me.company ? { id: me.company.id, name: me.company.name } : null;
-  res.json({ id: me.id, email: me.email, name: me.name, role: me.role, company });
+  res.json({ ok: true, profile: { id: me.id, email: me.email, name: me.name, role: me.role, company } });
 });
 
 /* ------------------------------- Listar usuarios -------------------------- */
@@ -46,10 +52,10 @@ companyRouter.get(
 
     if (role === Role.SUPER_ADMIN) {
       const q = parseId(req.query.companyId);
-      if (!q) return res.status(400).json({ error: 'companyId requerido para SUPER_ADMIN' });
+      if (!q) return err(res, 400, 'COMPANY_ID_REQUIRED', 'companyId requerido para SUPER_ADMIN');
       companyId = q;
     } else {
-      if (!Number.isFinite(companyId)) return res.status(400).json({ error: 'Sin empresa' });
+      if (!Number.isFinite(companyId)) return err(res, 400, 'NO_COMPANY', 'Sin empresa');
     }
 
     const users = await prisma.user.findMany({
@@ -59,7 +65,7 @@ companyRouter.get(
         isBlocked: true, mustChangePassword: true,
       },
     });
-    res.json({ companyId, users });
+    res.json({ ok: true, companyId, users });
   }
 );
 
@@ -78,7 +84,7 @@ companyRouter.post(
   async (req: any, res) => {
     const parsed = CreateUserInput.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ error: 'Validación', issues: parsed.error.format() });
+      return err(res, 400, 'BAD_BODY', 'Validación', parsed.error.format());
     }
 
     const role: Role = req.user.role;
@@ -86,32 +92,39 @@ companyRouter.post(
 
     if (role === Role.SUPER_ADMIN) {
       const cid = parsed.data.companyId;
-      if (!cid) return res.status(400).json({ error: 'companyId es requerido (SUPER_ADMIN)' });
+      if (!cid) return err(res, 400, 'COMPANY_ID_REQUIRED', 'companyId es requerido (SUPER_ADMIN)');
       companyId = cid;
     } else {
-      if (!Number.isFinite(companyId)) return res.status(400).json({ error: 'Sin empresa' });
+      if (!Number.isFinite(companyId)) return err(res, 400, 'NO_COMPANY', 'Sin empresa');
     }
 
     const count = await prisma.user.count({ where: { companyId, role: 'USER' } });
-    if (count >= 10) return res.status(400).json({ error: 'Límite de 10 usuarios alcanzado' });
+    if (count >= 10) return err(res, 400, 'LIMIT_REACHED', 'Límite de 10 usuarios alcanzado');
 
     const provisional = generateProvisionalPassword();
     const hash = await bcrypt.hash(provisional, 10);
 
-    const created = await prisma.user.create({
-      data: {
-        name: parsed.data.name,
-        email: parsed.data.email.toLowerCase(),
-        phone: parsed.data.phone ?? null,
-        role: 'USER',
-        companyId,
-        passwordHash: hash,
-        mustChangePassword: true,
-        provisionalExpiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
-      },
-    });
+    let created;
+    try {
+      created = await prisma.user.create({
+        data: {
+          name: parsed.data.name,
+          email: parsed.data.email.toLowerCase(),
+          phone: parsed.data.phone ?? null,
+          role: 'USER',
+          companyId,
+          passwordHash: hash,
+          mustChangePassword: true,
+          provisionalExpiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+        },
+      });
+    } catch (e: any) {
+      if (String(e?.code) === 'P2002') return err(res, 409, 'EMAIL_TAKEN', 'Email ya existente');
+      throw e;
+    }
 
     try { await sendProvisionalPassword(created.email, provisional); } catch {}
+
     const devLeak = process.env.RETURN_PROVISIONAL_IN_RESPONSE === '1' ? { provisional } : {};
     res.json({ ok: true, id: created.id, companyId, ...devLeak });
   }
@@ -130,20 +143,20 @@ companyRouter.post(
       const q = parseId(req.query.companyId);
       if (q) scopeCompanyId = q;
     } else if (!Number.isFinite(scopeCompanyId)) {
-      return res.status(400).json({ error: 'Sin empresa' });
+      return err(res, 400, 'NO_COMPANY', 'Sin empresa');
     }
 
     const uid = parseId(req.params.id);
-    if (!uid) return res.status(400).json({ error: 'id inválido' });
+    if (!uid) return err(res, 400, 'BAD_ID', 'id inválido');
 
     const target = await prisma.user.findUnique({ where: { id: uid } });
-    if (!target) return res.status(404).json({ error: 'Usuario no encontrado' });
+    if (!target) return err(res, 404, 'NOT_FOUND', 'Usuario no encontrado');
 
     if (role !== Role.SUPER_ADMIN && target.companyId !== scopeCompanyId) {
-      return res.status(403).json({ error: 'Forbidden' });
+      return err(res, 403, 'FORBIDDEN', 'Fuera del alcance de tu empresa');
     }
     if (target.role !== 'USER') {
-      return res.status(400).json({ error: 'Solo usuarios de rol USER' });
+      return err(res, 400, 'ONLY_USER', 'Solo usuarios de rol USER');
     }
 
     const provisional = generateProvisionalPassword();
@@ -180,20 +193,20 @@ companyRouter.delete(
       const q = parseId(req.query.companyId);
       if (q) scopeCompanyId = q;
     } else {
-      if (!Number.isFinite(scopeCompanyId)) return res.status(400).json({ error: 'Sin empresa' });
+      if (!Number.isFinite(scopeCompanyId)) return err(res, 400, 'NO_COMPANY', 'Sin empresa');
     }
 
     const id = parseId(req.params.id);
-    if (!id) return res.status(400).json({ error: 'id inválido' });
+    if (!id) return err(res, 400, 'BAD_ID', 'id inválido');
 
     const user = await prisma.user.findUnique({ where: { id } });
-    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+    if (!user) return err(res, 404, 'NOT_FOUND', 'Usuario no encontrado');
 
     if (role !== Role.SUPER_ADMIN && user.companyId !== scopeCompanyId) {
-      return res.status(403).json({ error: 'Forbidden' });
+      return err(res, 403, 'FORBIDDEN', 'Fuera del alcance de tu empresa');
     }
     if (user.role === 'COMPANY_ADMIN' && role !== Role.SUPER_ADMIN) {
-      return res.status(400).json({ error: 'No permitido' });
+      return err(res, 400, 'NOT_ALLOWED', 'No permitido eliminar COMPANY_ADMIN sin SUPER_ADMIN');
     }
 
     await prisma.user.delete({ where: { id } });
@@ -211,10 +224,10 @@ companyRouter.get(
     let companyId = Number(req.user.companyId ?? NaN);
     if (role === Role.SUPER_ADMIN) {
       const q = parseId(req.query.companyId);
-      if (!q) return res.status(400).json({ error: 'companyId requerido para SUPER_ADMIN' });
+      if (!q) return err(res, 400, 'COMPANY_ID_REQUIRED', 'companyId requerido para SUPER_ADMIN');
       companyId = q;
     } else if (!Number.isFinite(companyId)) {
-      return res.status(400).json({ error: 'Sin empresa' });
+      return err(res, 400, 'NO_COMPANY', 'Sin empresa');
     }
 
     const cats = await prisma.category.findMany({ include: { products: true } });
@@ -225,6 +238,7 @@ companyRouter.get(
     const allowedSet = new Set(allowed.map(a => a.productId));
 
     res.json({
+      ok: true,
       companyId,
       categories: cats.map(c => ({
         id: c.id,
@@ -248,20 +262,19 @@ companyRouter.post(
   async (req: any, res) => {
     const schema = z.object({ productIds: z.array(z.number().int().positive()) });
     const parsed = schema.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: 'Validación', issues: parsed.error.format() });
+    if (!parsed.success) return err(res, 400, 'BAD_BODY', 'Validación', parsed.error.format());
 
     const role: Role = req.user.role;
     let companyId = Number(req.user.companyId ?? NaN);
     if (role === Role.SUPER_ADMIN) {
       const q = parseId(req.query.companyId);
-      if (!q) return res.status(400).json({ error: 'companyId requerido para SUPER_ADMIN' });
+      if (!q) return err(res, 400, 'COMPANY_ID_REQUIRED', 'companyId requerido para SUPER_ADMIN');
       companyId = q;
     } else if (!Number.isFinite(companyId)) {
-      return res.status(400).json({ error: 'Sin empresa' });
+      return err(res, 400, 'NO_COMPANY', 'Sin empresa');
     }
 
     await prisma.companyProduct.deleteMany({ where: { companyId } });
-
     const uniqueIds = Array.from(new Set(parsed.data.productIds));
     if (uniqueIds.length) {
       await prisma.companyProduct.createMany({
@@ -280,14 +293,14 @@ companyRouter.get(
   requireRole(Role.SUPER_ADMIN, Role.COMPANY_ADMIN),
   async (req: any, res) => {
     const companyId = parseId(req.params.id);
-    if (!companyId) return res.status(400).json({ error: 'companyId inválido' });
+    if (!companyId) return err(res, 400, 'BAD_ID', 'companyId inválido');
     if (!assertScopeOr403(req, res, companyId)) return;
 
     const rows = await prisma.companyProduct.findMany({
       where: { companyId },
       select: { productId: true },
     });
-    return res.json({ companyId, enabledProductIds: rows.map(r => r.productId) });
+    return res.json({ ok: true, companyId, enabledProductIds: rows.map(r => r.productId) });
   }
 );
 
@@ -301,11 +314,11 @@ companyRouter.put(
   requireRole(Role.SUPER_ADMIN, Role.COMPANY_ADMIN),
   async (req: any, res) => {
     const companyId = parseId(req.params.id);
-    if (!companyId) return res.status(400).json({ error: 'companyId inválido' });
+    if (!companyId) return err(res, 400, 'BAD_ID', 'companyId inválido');
     if (!assertScopeOr403(req, res, companyId)) return;
 
     const parsed = PutEnabledInput.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: 'Validación', issues: parsed.error.format() });
+    if (!parsed.success) return err(res, 400, 'BAD_BODY', 'Validación', parsed.error.format());
 
     const distinct = Array.from(new Set(parsed.data.productIds));
 
@@ -315,7 +328,7 @@ companyRouter.put(
     });
     const foundSet = new Set(found.map(p => p.id));
     const invalid = distinct.filter(id => !foundSet.has(id));
-    if (invalid.length) return res.status(400).json({ error: 'PRODUCT_NOT_FOUND', invalid });
+    if (invalid.length) return err(res, 400, 'PRODUCT_NOT_FOUND', 'IDs inválidos', { invalid });
 
     const current = await prisma.companyProduct.findMany({
       where: { companyId },
@@ -347,6 +360,7 @@ companyRouter.put(
     });
 
     return res.json({
+      ok: true,
       companyId,
       enabledProductIds: rows.map(r => r.productId),
       changed: { enabled: toCreate, disabled: toDelete },
@@ -365,17 +379,17 @@ companyRouter.patch(
   requireRole(Role.SUPER_ADMIN, Role.COMPANY_ADMIN),
   async (req: any, res) => {
     const companyId = parseId(req.params.id);
-    if (!companyId) return res.status(400).json({ error: 'companyId inválido' });
+    if (!companyId) return err(res, 400, 'BAD_ID', 'companyId inválido');
     if (!assertScopeOr403(req, res, companyId)) return;
 
     const parsed = ToggleInput.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ error: 'Validación', issues: parsed.error.format() });
+      return err(res, 400, 'BAD_BODY', 'Validación', parsed.error.format());
     }
     const { productId, enabled } = parsed.data;
 
     const exists = await prisma.product.findUnique({ where: { id: productId }, select: { id: true } });
-    if (!exists) return res.status(400).json({ error: 'PRODUCT_NOT_FOUND', productId });
+    if (!exists) return err(res, 400, 'PRODUCT_NOT_FOUND', 'Producto inexistente', { productId });
 
     if (enabled) {
       await prisma.companyProduct.upsert({
@@ -391,7 +405,7 @@ companyRouter.patch(
       by: req.user?.id, role: req.user?.role, companyId, productId, enabled,
     });
 
-    return res.json({ companyId, productId, enabled });
+    return res.json({ ok: true, companyId, productId, enabled });
   }
 );
 
