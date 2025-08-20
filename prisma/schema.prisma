@@ -1,0 +1,155 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/**
+ * =======================
+ * Enums
+ * =======================
+ */
+enum Role {
+  SUPER_ADMIN
+  COMPANY_ADMIN
+  USER
+}
+
+enum OrderStatus {
+  SUBMITTED
+  PREPARING
+  EN_ROUTE
+  DELIVERED
+  CANCELLED
+}
+
+/**
+ * =======================
+ * Core
+ * =======================
+ */
+model Company {
+  id           Int              @id @default(autoincrement())
+  name         String
+  rut          String
+  phone        String?
+  email        String?
+  contactName  String?
+  contactPhone String?
+  users        User[]
+  allowed      CompanyProduct[] // presencia = habilitado
+  orders       Order[]
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+}
+
+model User {
+  id                   Int       @id @default(autoincrement())
+  email                String    @unique
+  name                 String
+  phone                String?
+  role                 Role
+  companyId            Int?
+  company              Company?  @relation(fields: [companyId], references: [id])
+  passwordHash         String
+  mustChangePassword   Boolean   @default(false)
+  provisionalExpiresAt DateTime?
+  isBlocked            Boolean   @default(false)
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  orders        Order[]
+  statusChanges OrderStatusLog[] @relation("StatusChangedBy") // cambios de estado hechos por este usuario
+}
+
+model Category {
+  id       Int       @id @default(autoincrement())
+  name     String    @unique
+  products Product[]
+}
+
+model Product {
+  id         Int              @id @default(autoincrement())
+  title      String
+  detail     String?
+  imageUrl   String?
+  categoryId Int
+  category   Category         @relation(fields: [categoryId], references: [id])
+  authorized CompanyProduct[] // presencia = habilitado
+  orderItems OrderItem[]
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+}
+
+model CompanyProduct {
+  companyId Int
+  productId Int
+
+  company Company @relation(fields: [companyId], references: [id])
+  product Product @relation(fields: [productId], references: [id])
+
+  @@id([companyId, productId]) // clave compuesta; SIN columna enabled
+}
+
+/**
+ * =======================
+ * Pedidos
+ * =======================
+ */
+model Order {
+  id        Int         @id @default(autoincrement())
+  companyId Int
+  userId    Int
+  note      String?
+  emergency Boolean     @default(false)
+  extraCost Int?
+  status    OrderStatus @default(SUBMITTED)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  items OrderItem[]
+  logs  OrderStatusLog[]
+
+  company Company @relation(fields: [companyId], references: [id])
+  user    User    @relation(fields: [userId], references: [id])
+}
+
+model OrderItem {
+  id           Int    @id @default(autoincrement())
+  orderId      Int
+  productId    Int
+  quantity     Int
+  productTitle String
+
+  order   Order   @relation(fields: [orderId], references: [id])
+  product Product @relation(fields: [productId], references: [id])
+}
+
+model OrderStatusLog {
+  id        Int          @id @default(autoincrement())
+  orderId   Int
+  from      OrderStatus?
+  to        OrderStatus
+  changedBy Int?
+  createdAt DateTime     @default(now())
+
+  order Order @relation(fields: [orderId], references: [id])
+  user  User? @relation("StatusChangedBy", fields: [changedBy], references: [id])
+}
+
+/**
+ * =======================
+ * Configuración global
+ * =======================
+ */
+model GlobalConfig {
+  id                 Int      @id @default(1) // fila única id=1
+  emergencyExtraCost Int?
+  emergencyDays      String? // ej: "Mon,Tue,Wed,Thu,Fri"
+  emergencyHours     String? // ej: "08:00-18:00"
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
