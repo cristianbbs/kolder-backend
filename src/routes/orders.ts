@@ -6,12 +6,15 @@ import { z } from 'zod';
 
 export const ordersRouter = Router();
 
-/* ============================================================
-   Helpers: validación y transiciones de estado
-   ============================================================ */
+/* ========================== Helpers: errores y transiciones ========================== */
+function err(res: any, status: number, code: string, message: string, issues?: unknown) {
+  const body: any = { ok: false, code, message };
+  if (issues !== undefined) body.issues = issues;
+  return res.status(status).json(body);
+}
+
 const FINAL_STATES: OrderStatus[] = [OrderStatus.DELIVERED, OrderStatus.CANCELLED];
 
-// Usamos claves string para evitar fricciones de typing con enums de Prisma
 const TRANSITIONS: Record<string, OrderStatus[]> = {
   [OrderStatus.SUBMITTED]: [OrderStatus.PREPARING, OrderStatus.CANCELLED],
   [OrderStatus.PREPARING]: [OrderStatus.EN_ROUTE,  OrderStatus.CANCELLED],
@@ -25,7 +28,7 @@ function canTransition(from: OrderStatus, to: OrderStatus): boolean {
   return (TRANSITIONS[from] ?? []).includes(to);
 }
 
-// zod: entrada para crear pedido
+/* ========================== Zod schemas ========================== */
 const OrderItemInput = z.object({
   productId: z.number().int().positive(),
   quantity: z.number().int().min(1).max(999),
@@ -36,17 +39,13 @@ const CreateOrderInput = z.object({
   emergency: z.boolean().optional(),
 });
 
-// zod: entrada para cambio de estado
 const ChangeStatusInput = z.object({
   status: z.nativeEnum(OrderStatus),
-  // note: z.string().trim().max(500).optional(), // <- descomenta si tu schema de log tiene `note`
 });
 
 ordersRouter.use(requireAuth);
 
-/* ============================================================
-   GET /orders - historial según rol/alcance
-   ============================================================ */
+/* ========================== GET /orders (alcance por rol) ========================== */
 ordersRouter.get('/', async (req: any, res) => {
   const role: string = String(req.user.role || '');
   const userId: number = req.user.id;
@@ -56,10 +55,10 @@ ordersRouter.get('/', async (req: any, res) => {
   if (role === 'SUPER_ADMIN') {
     // sin filtros
   } else if (role === 'COMPANY_ADMIN') {
-    if (companyId == null) return res.status(400).json({ error: 'Tu usuario no tiene empresa asignada' });
+    if (companyId == null) return err(res, 400, 'NO_COMPANY', 'Tu usuario no tiene empresa asignada');
     where.companyId = companyId;
   } else {
-    if (companyId == null) return res.status(400).json({ error: 'Tu usuario no tiene empresa asignada' });
+    if (companyId == null) return err(res, 400, 'NO_COMPANY', 'Tu usuario no tiene empresa asignada');
     where.companyId = companyId;
     where.userId = userId; // USER solo ve sus pedidos
   }
@@ -67,12 +66,11 @@ ordersRouter.get('/', async (req: any, res) => {
   const orders = await prisma.order.findMany({
     where,
     orderBy: { createdAt: 'desc' },
-    include: {
-      items: { include: { product: { select: { id: true, title: true } } } },
-    },
+    include: { items: { include: { product: { select: { id: true, title: true } } } } },
   });
 
   res.json({
+    ok: true,
     orders: orders.map(o => ({
       id: o.id,
       status: o.status,
@@ -89,31 +87,23 @@ ordersRouter.get('/', async (req: any, res) => {
   });
 });
 
-/* ============================================================
-   POST /orders - crear pedido
-   ============================================================ */
+/* ========================== POST /orders (crear pedido) ========================== */
 ordersRouter.post('/', async (req: any, res) => {
   const parsed = CreateOrderInput.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: 'Payload inválido', issues: parsed.error.format() });
-  }
-  const { items, emergency = false, note } = parsed.data;
+  if (!parsed.success) return err(res, 400, 'BAD_BODY', 'Payload inválido', parsed.error.format());
 
+  const { items, emergency = false, note } = parsed.data;
   const userId: number = req.user.id;
   const companyIdRaw = req.user.companyId ?? null;
-  if (!Number.isFinite(Number(companyIdRaw))) {
-    return res.status(400).json({ error: 'Tu usuario no tiene empresa asignada' });
-  }
+  if (!Number.isFinite(Number(companyIdRaw))) return err(res, 400, 'NO_COMPANY', 'Tu usuario no tiene empresa asignada');
   const companyId = Number(companyIdRaw);
 
-  // Validar productos existentes
   const ids = Array.from(new Set(items.map(i => i.productId)));
   const found = await prisma.product.findMany({ where: { id: { in: ids } }, select: { id: true, title: true } });
-  if (found.length !== ids.length) return res.status(400).json({ error: 'Hay productos inexistentes en el pedido' });
+  if (found.length !== ids.length) return err(res, 400, 'PRODUCT_NOT_FOUND', 'Hay productos inexistentes en el pedido');
 
   const titleById = new Map(found.map(p => [p.id, p.title]));
 
-  // Costo emergencia (snapshot)
   let extraCost: number | null = null;
   if (emergency) {
     const cfg = await prisma.globalConfig.findFirst({ where: { id: 1 } }).catch(() => null);
@@ -142,19 +132,14 @@ ordersRouter.post('/', async (req: any, res) => {
     });
 
     await tx.orderStatusLog.create({
-      data: {
-        orderId: order.id,
-        from: null,
-        to: OrderStatus.SUBMITTED,
-        changedBy: userId,
-        // note: note?.trim() || null, // <- descomenta si tu log tiene campo `note`
-      },
+      data: { orderId: order.id, from: null, to: OrderStatus.SUBMITTED, changedBy: userId },
     });
 
     return order;
   });
 
   res.status(201).json({
+    ok: true,
     id: created.id,
     status: created.status,
     createdAt: created.createdAt,
@@ -168,23 +153,19 @@ ordersRouter.post('/', async (req: any, res) => {
   });
 });
 
-/* ============================================================
-   POST /orders/:id/repeat - clonar items
-   ============================================================ */
+/* ========================== POST /orders/:id/repeat ========================== */
 ordersRouter.post('/:id/repeat', async (req: any, res) => {
   const id = Number(req.params.id);
-  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'id inválido' });
+  if (!Number.isFinite(id) || id <= 0) return err(res, 400, 'BAD_ID', 'id inválido');
 
   const userId: number = req.user.id;
   const companyIdRaw = req.user.companyId ?? null;
-  if (!Number.isFinite(Number(companyIdRaw))) {
-    return res.status(400).json({ error: 'Tu usuario no tiene empresa asignada' });
-  }
+  if (!Number.isFinite(Number(companyIdRaw))) return err(res, 400, 'NO_COMPANY', 'Tu usuario no tiene empresa asignada');
   const companyId = Number(companyIdRaw);
 
   const base = await prisma.order.findFirst({ where: { id, userId }, include: { items: true } });
-  if (!base) return res.status(404).json({ error: 'Pedido no encontrado' });
-  if (!base.items.length) return res.status(400).json({ error: 'Pedido base sin ítems' });
+  if (!base) return err(res, 404, 'NOT_FOUND', 'Pedido no encontrado');
+  if (!base.items.length) return err(res, 400, 'BASE_EMPTY', 'Pedido base sin ítems');
 
   const created = await prisma.$transaction(async tx => {
     const order = await tx.order.create({
@@ -207,19 +188,14 @@ ordersRouter.post('/:id/repeat', async (req: any, res) => {
     });
 
     await tx.orderStatusLog.create({
-      data: {
-        orderId: order.id,
-        from: null,
-        to: OrderStatus.SUBMITTED,
-        changedBy: userId,
-        // note: null, // <- descomenta si tu log tiene campo `note`
-      },
+      data: { orderId: order.id, from: null, to: OrderStatus.SUBMITTED, changedBy: userId },
     });
 
     return order;
   });
 
   res.status(201).json({
+    ok: true,
     id: created.id,
     status: created.status,
     createdAt: created.createdAt,
@@ -231,119 +207,93 @@ ordersRouter.post('/:id/repeat', async (req: any, res) => {
   });
 });
 
-/* ============================================================
-   PUT /orders/:id/status - cambiar estado (ADMIN)
-   Roles permitidos: SUPER_ADMIN, COMPANY_ADMIN
-   ============================================================ */
+/* ========================== PUT /orders/:id/status (ADMIN) ========================== */
 ordersRouter.put('/:id/status', async (req: any, res) => {
   const role = String(req.user.role || '');
   if (!['SUPER_ADMIN', 'COMPANY_ADMIN'].includes(role)) {
-    return res.status(403).json({ error: 'FORBIDDEN', detail: 'Rol no autorizado' });
+    return err(res, 403, 'FORBIDDEN', 'Solo COMPANY_ADMIN/SUPER_ADMIN');
   }
 
   const id = Number(req.params.id);
-  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'id inválido' });
+  if (!Number.isFinite(id) || id <= 0) return err(res, 400, 'BAD_ID', 'id inválido');
 
   const parsed = ChangeStatusInput.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: 'VALIDATION_ERROR', issues: parsed.error.format() });
-  }
-  const { status /*, note*/ } = parsed.data;
+  if (!parsed.success) return err(res, 400, 'BAD_BODY', 'Payload inválido', parsed.error.format());
+
+  const { status } = parsed.data;
   const userId: number = req.user.id;
   const companyId: number | null = Number.isFinite(Number(req.user.companyId)) ? Number(req.user.companyId) : null;
 
   try {
-    // Cargar pedido
-    const order = await prisma.order.findUnique({
-      where: { id },
-      select: { id: true, status: true, companyId: true },
-    });
-    if (!order) return res.status(404).json({ error: 'NOT_FOUND' });
+    const order = await prisma.order.findUnique({ where: { id }, select: { id: true, status: true, companyId: true } });
+    if (!order) return err(res, 404, 'NOT_FOUND', 'Pedido no encontrado');
 
-    // Alcance empresa para COMPANY_ADMIN
+    // COMPANY_ADMIN fuera de su empresa => 404 (no revelar existencia)
     if (role === 'COMPANY_ADMIN') {
       if (companyId == null || order.companyId !== companyId) {
-        return res.status(403).json({ error: 'FORBIDDEN', detail: 'Fuera del ámbito de tu empresa' });
+        return err(res, 404, 'NOT_FOUND', 'Pedido no encontrado');
       }
     }
 
     if (FINAL_STATES.includes(order.status)) {
-      return res.status(409).json({ error: 'ORDER_FINAL_STATE', detail: `Ya finalizado: ${order.status}` });
+      return err(res, 409, 'ORDER_FINAL_STATE', `Ya finalizado: ${order.status}`);
     }
     if (!canTransition(order.status, status)) {
-      return res.status(409).json({ error: 'INVALID_TRANSITION', detail: `${order.status} -> ${status}` });
+      return err(res, 409, 'INVALID_TRANSITION', `${order.status} -> ${status}`);
     }
 
-    // Transacción: update + log
     const updated = await prisma.$transaction(async (tx) => {
       const u = await tx.order.update({
         where: { id },
         data: { status },
         select: { id: true, status: true, updatedAt: true, companyId: true, userId: true },
       });
-
-      await tx.orderStatusLog.create({
-        data: {
-          orderId: id,
-          from: order.status,
-          to: status,
-          changedBy: userId,
-          // note: note ?? null, // <- descomenta si tu log tiene `note`
-        },
-      });
-
+      await tx.orderStatusLog.create({ data: { orderId: id, from: order.status, to: status, changedBy: userId } });
       return u;
     });
 
-    // Línea de tiempo
     const timeline = await prisma.orderStatusLog.findMany({
       where: { orderId: id },
       orderBy: { createdAt: 'asc' },
-      select: { id: true, from: true, to: true, changedBy: true, createdAt: true /*, note: true*/ },
+      select: { id: true, from: true, to: true, changedBy: true, createdAt: true },
     });
 
     return res.json({ ok: true, order: { ...updated, statusLogs: timeline } });
   } catch (e: any) {
     console.error('[ORDERS][:id/status] error', e);
-    return res.status(500).json({ error: 'INTERNAL_ERROR' });
+    return err(res, 500, 'INTERNAL', 'Error interno');
   }
 });
 
-/* ============================================================
-   GET /orders/:id - detalle del pedido + timeline
-   ============================================================ */
+/* ========================== GET /orders/:id (detalle + timeline) ========================== */
 ordersRouter.get('/:id', async (req: any, res) => {
   const id = Number(req.params.id);
-  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'id inválido' });
+  if (!Number.isFinite(id) || id <= 0) return err(res, 400, 'BAD_ID', 'id inválido');
 
   const auth = req.user as { id: number; companyId?: number; role?: string };
 
-  // Cargar pedido con ítems
   const order = await prisma.order.findUnique({
     where: { id },
-    include: {
-      items: { select: { id: true, productId: true, quantity: true, productTitle: true } },
-    },
+    include: { items: { select: { id: true, productId: true, quantity: true, productTitle: true } } },
   });
-  if (!order) return res.status(404).json({ error: 'NOT_FOUND' });
+  if (!order) return err(res, 404, 'NOT_FOUND', 'Pedido no encontrado');
 
-  // Autorización: dueño, o ADMIN de misma empresa, o SUPER_ADMIN
+  // Dueño (OK) | Admin misma empresa (OK) | Super admin (OK) | resto => 404 (no revelar)
   const isOwner = order.userId === auth.id;
   const isAdmin = auth?.role === 'COMPANY_ADMIN' || auth?.role === 'SUPER_ADMIN';
   const sameCompany = Number.isFinite(Number(auth.companyId)) && order.companyId === Number(auth.companyId);
-
-  if (!(isOwner || (isAdmin && sameCompany))) {
-    // puedes cambiar a 404 si prefieres ocultar existencia
-    return res.status(403).json({ error: 'FORBIDDEN' });
+  if (!(isOwner || (isAdmin && sameCompany) || auth?.role === 'SUPER_ADMIN')) {
+    return err(res, 404, 'NOT_FOUND', 'Pedido no encontrado');
   }
 
   const timeline = await prisma.orderStatusLog.findMany({
     where: { orderId: id },
     orderBy: { createdAt: 'asc' },
-    select: { id: true, from: true, to: true, changedBy: true, createdAt: true /*, note: true*/ },
+    select: { id: true, from: true, to: true, changedBy: true, createdAt: true },
   });
 
   return res.json({
+    ok: true,
     order: {
       id: order.id,
       status: order.status,
